@@ -299,7 +299,7 @@ if __name__ == '__main__':
             model=MODEL,
             messages=prompt_history,
             max_tokens=max_tokens,
-            temperature=.2,
+            temperature=0,
         )
         end_time = time.time()
         print(f'Done in {end_time - start_time:.2f}s')

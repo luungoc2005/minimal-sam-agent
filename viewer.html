@@ -1,0 +1,88 @@
+<html>
+  <head>
+    <title>History Viewer</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
+    />
+  </head>
+  <body>
+    <script type="module">
+      import { h, render } from 'https://esm.sh/preact';
+      import { useEffect, useState, useCallback } from 'https://esm.sh/preact/hooks';
+      import htm from 'https://esm.sh/htm';
+    
+      // Initialize htm with Preact
+      const html = htm.bind(h);
+    
+      function App (props) {
+        const params = new URL(document.location.toString()).searchParams;
+        const fileName = params.get('file');
+        const [data, setData] = useState([]);
+        const [currentIndex, setCurrentIndex] = useState(0);
+
+        useState(() => {
+          fetch(`/${fileName}`)
+            .then(response => response.json())
+            .then(data => setData(data))
+        }, []);
+
+        useEffect(() => {
+          setCurrentIndex(data.findIndex(item => item.role === 'assistant'))
+        }, [data]);
+
+        const handleKeyPress = useCallback((e) => {
+          const assistantEntries = data.map((item, idx) => item.role === 'assistant' ? idx : null).filter(Boolean);
+          if (e.key === 'ArrowLeft') {
+            const navigateTo = assistantEntries[assistantEntries.findIndex(idx => idx === currentIndex) - 1];
+            setCurrentIndex(Math.max(0, navigateTo));
+          } else if (e.key === 'ArrowRight') {
+            const navigateTo = assistantEntries[assistantEntries.findIndex(idx => idx === currentIndex) + 1];
+            setCurrentIndex(Math.min(data.length - 1, navigateTo));
+          }
+        }, [currentIndex, setCurrentIndex, data]);
+
+        useEffect(() => {
+          window.addEventListener('keydown', handleKeyPress);
+          return () => window.removeEventListener('keydown', handleKeyPress);
+        }, [handleKeyPress])
+
+        function parseEntry(assistantEntry) {
+          // Assistant reply should be in the format Thought: <content>\nAction: <content>
+          let thought = /Thought: (.*)/.exec(assistantEntry.content)[1];
+          let action = /Action: (.*)/.exec(assistantEntry.content)[1];
+          return {
+            thought, action
+          }
+        }
+
+        return html`<div class="grid">
+          <div>
+            <img style="max-height: 100vh;" src=${data[currentIndex - 1]?.content[0]?.image_url?.url} />
+          </div>
+          <div>
+            <ul style="max-height: 100vh; overflow: scroll;">
+              ${data
+                .map((item, index) => {
+                  if (item.role !== 'assistant') return null;
+                  const parsed = parseEntry(item);
+                  return html`<li key=${index}>
+                    <button class="outline ${index === currentIndex ? 'primary' : 'secondary'}"
+                      style="text-align: left;" 
+                      onClick=${() => setCurrentIndex(index)}
+                    >
+                      <div>${parsed.thought}</div>
+                      <code>${parsed.action}</code>
+                    </button>
+                  </li>`
+                })
+                .filter(Boolean)}
+            </ul>
+          </div>
+        </div>`;
+      }
+    
+      render(html`<${App} name="World" />`, document.body);
+    </script>
+  </body>
+</html>
