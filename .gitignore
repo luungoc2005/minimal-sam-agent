@@ -1,5 +1,7 @@
 annotated.png
 screenshot.png
+screenshot.json
 history.json
 mask_coords.json
+examples/grab_*
 .env

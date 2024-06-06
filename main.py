@@ -12,8 +12,11 @@ import cv2
 from PIL import Image
 import numpy as np
 import openai
+import torch
 
 sam_checkpoint = os.getenv('SAM_CHECKPOINT_PATH')
+is_fast_sam = 'fastsam' in sam_checkpoint.lower()
+click_origin = "center"
 
 # annotation contstants
 screenshot_path = './screenshot.png'
@@ -39,29 +42,54 @@ prompt = (
     "- tap_at_location: Tap at a specific location on the screen. Example: tap_at_location 1\n"
     "- long_press_at_location: Tap and hold at a specific location on the screen. Example: long_press_at_location 1\n"
     "- enter_text_at_location: Enter text at a specific location on the screen. Example: enter_text_at_location 1 'Hello'\n"
+    "- clear_text_at_location: Select all and clear existing text at a specific input field on the screen. Example: clear_text_at_location 1\n"
     "- swipe_at_location: Swipe up/down/left/right at a specific location on the screen. Example: swipe_at_location 1 up\n"
     "- wait: Wait and do nothing for a few seconds. Use when something is in progress.\n"
     "You must reply in the following format:\n"
     "Thought: your rationale for the action\n"
-    "Action: the action to be performed. Only use 1 action at a time\n"
+    "Action: the action to be performed. Only use 1 action at a time. Use the exact command and syntax as provided in examples.\n"
 )
 MODEL = 'gpt-4o'
 MAX_TOKENS = 100
 
 # SAM
+def get_bbox_from_mask(mask, scale_x=1, scale_y=1):
+    mask = mask.astype(np.uint8)
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if len(contours) == 0:
+        return None
+    x1, y1, w, h = cv2.boundingRect(contours[0])
+    x2, y2 = x1 + w, y1 + h
+    if len(contours) > 1:
+        for b in contours:
+            x_t, y_t, w_t, h_t = cv2.boundingRect(b)
+            x1 = min(x1, x_t)
+            y1 = min(y1, y_t)
+            x2 = max(x2, x_t + w_t)
+            y2 = max(y2, y_t + h_t)
+        h = y2 - y1
+        w = x2 - x1
+    return [x1 * scale_x, y1 * scale_y, w * scale_x, h * scale_y]
 
 def get_mask_generator():
-    from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+    if is_fast_sam:
+        from fastsam import FastSAM
+        return FastSAM(sam_checkpoint)
+    else:
+        from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
-    model_type = "vit_b"
-    device = "cpu"
-    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
-    sam.to(device=device)
+        model_type = "vit_b"
+        device = "cpu"
+        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam.to(device=device)
 
-    return SamAutomaticMaskGenerator(sam, 
-        points_per_batch=64, 
-        output_mode='uncompressed_rle'
-    )
+        return SamAutomaticMaskGenerator(sam, 
+            points_per_batch=64, 
+            output_mode='uncompressed_rle',
+            min_mask_region_area=10,
+        )
 
 def load_image(image_path, transform_size=None):
     raw_image = Image.open(image_path).convert("RGB")
@@ -134,28 +162,37 @@ def get_annotations(raw_image, anns):
 
     mark_coords = {}
     for ix, ann in enumerate(sorted_anns):
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        text = f'{ix + 1}'
-        box_coord = ann['bbox']
-        x, y, w, h = box_coord
-        # calculate text coords
-        bbox_x, bbox_y = int(x), int(y)
-        mark_coords[ix + 1] = int(bbox_x + w // 2), int(bbox_y + h // 2)
+        try:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text = f'{ix + 1}'
+            box_coord = ann['bbox']
+            x, y, w, h = box_coord
+            # calculate text coords
+            bbox_x, bbox_y = int(x), int(y)
+            if click_origin == "center":
+                mark_coords[ix + 1] = int(bbox_x + w // 2), int(bbox_y + h // 2)
+            elif click_origin == "topleft":
+                mark_coords[ix + 1] = int(bbox_x) + 1, int(bbox_y) + 1
+            else:
+                print("Unsupported click origin. Exiting.")
+                exit(1)
 
-        bg_color_text = contrasting_color(raw_image[bbox_y, bbox_x][:3])
-        bg_color = (0, 0, 0) if bg_color_text == 'black' else (255, 255, 255)
-        text_color = (0, 0, 0) if bg_color_text == 'white' else (255, 255, 255)
-        vspace = 8
-        hspace = 5
-        
-        raw_image = write_text(
-            raw_image, 
-            text, 
-            bbox_x + hspace, bbox_y + vspace, 
-            vspace, hspace, font_scale, 
-            bg_color,
-            text_color,
-            font, thickness, mark_alpha)
+            bg_color_text = contrasting_color(raw_image[bbox_y, bbox_x][:3])
+            bg_color = (0, 0, 0) if bg_color_text == 'black' else (255, 255, 255)
+            text_color = (0, 0, 0) if bg_color_text == 'white' else (255, 255, 255)
+            vspace = 8
+            hspace = 5
+            
+            raw_image = write_text(
+                raw_image, 
+                text, 
+                bbox_x + hspace, bbox_y + vspace, 
+                vspace, hspace, font_scale, 
+                bg_color,
+                text_color,
+                font, thickness, mark_alpha)
+        except:
+            pass
     return raw_image, mark_coords
 
 if __name__ == '__main__':
@@ -176,6 +213,11 @@ if __name__ == '__main__':
             }
         ]
 
+    def get_device_size():
+        output = subprocess.check_output('adb shell wm size', shell=True)
+        output = output.decode('utf-8').strip().split(': ')[1].split('x')
+        return int(output[0]), int(output[1])
+
     def get_screenshot_reply():
         def encode_image(image_path):
             with open(image_path, "rb") as image_file:
@@ -183,11 +225,36 @@ if __name__ == '__main__':
             return f"data:image/png;base64,{base64_image}"
 
         subprocess.call(f"adb shell screencap -p > {screenshot_path}", shell=True)
-        raw_image, orig_width, orig_height = load_image(screenshot_path, size)
+        orig_width, orig_height = get_device_size()
 
         start_time = time.time()
         print('Generating masks...', end=' ')
-        masks = mask_generator.generate(np.array(raw_image))
+        if is_fast_sam:
+            from fastsam import FastSAMPrompt
+            raw_image, raw_width, raw_height = load_image(screenshot_path, size)
+            device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+            everything_results = mask_generator(raw_image, device=device, imgsz=size, iou=.9, conf=.1)
+            prompt_process = FastSAMPrompt(raw_image, everything_results, device=device)
+            w_h_ratio = raw_width / raw_height
+            if w_h_ratio < 1: # landscape
+                result_width, result_height = size, size / w_h_ratio
+            else: # portrait
+                result_width, result_height = size * w_h_ratio, size
+            scale_x = raw_width / result_width
+            scale_y = raw_height / result_height
+            masks = []
+            for mask in prompt_process.results[0].masks.data:
+                bbox = get_bbox_from_mask(mask.cpu().numpy(), scale_x, scale_y)
+                if bbox is None:
+                    continue
+                area = mask.sum().item()
+                masks.append({
+                    'bbox': bbox,
+                    'area': area,
+                })
+        else:
+            raw_image, _, _ = load_image(screenshot_path, size)
+            masks = mask_generator.generate(np.array(raw_image))
         end_time = time.time()
         print(f'Done in {end_time - start_time:.2f}s')
 
@@ -251,7 +318,7 @@ if __name__ == '__main__':
             text = ' '.join(action_params[2:])
             x, y = mask_coords[location]
             print('Tapping at', x, y)
-            subprocess.Popen(f'adb shell input tap {x} {y}', shell=True)
+            subprocess.call(f'adb shell input tap {x} {y}', shell=True)
             time.sleep(1)
             print('Typing', text)
             subprocess.Popen(f"adb shell input text $(echo '{text}' | sed 's/ /\%s/g')", shell=True)
@@ -271,6 +338,16 @@ if __name__ == '__main__':
             elif direction == 'right':
                 subprocess.Popen(f'adb shell input swipe {x} {y} {x + swipe_distance} {y}', shell=True)
             time.sleep(1)
+            return get_screenshot_reply()
+        elif action_name == 'clear_text_at_location':
+            location = int(action_params[1])
+            x, y = mask_coords[location]
+            print('Tapping at', x, y)
+            subprocess.call(f'adb shell input tap {x} {y}', shell=True)
+            time.sleep(1)
+            print('Clearing text')
+            subprocess.call(f'adb shell input keyevent KEYCODE_MOVE_END', shell=True)
+            subprocess.call("adb shell input keyevent --longpress $(printf 'KEYCODE_DEL %.0s' {1..250})", shell=True)
             return get_screenshot_reply()
         elif action_name == 'wait':
             time.sleep(5)
@@ -308,7 +385,6 @@ if __name__ == '__main__':
         return history, new_message
 
     # main loop
-    time.sleep(3) # wait for app start
     user_reply, mask_coords = get_screenshot_reply()
     while user_reply is not None:
         agent_history.append(user_reply)
