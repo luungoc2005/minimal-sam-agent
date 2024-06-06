@@ -1,0 +1,1 @@
+Set an alarm at 12:30pm every Friday and Sunday and disable the vibration
